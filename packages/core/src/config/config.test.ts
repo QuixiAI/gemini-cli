@@ -38,6 +38,7 @@ import {
   DEFAULT_GEMINI_MODEL,
   DEFAULT_GEMINI_MODEL_AUTO,
   PREVIEW_GEMINI_MODEL,
+  PREVIEW_GEMINI_MODEL_AUTO,
 } from './models.js';
 
 vi.mock('fs', async (importOriginal) => {
@@ -63,6 +64,13 @@ vi.mock('../tools/tool-registry', () => {
   ToolRegistryMock.prototype.getFunctionDeclarations = vi.fn(() => []);
   return { ToolRegistry: ToolRegistryMock };
 });
+
+vi.mock('../tools/mcp-client-manager.js', () => ({
+  McpClientManager: vi.fn().mockImplementation(() => ({
+    startConfiguredMcpServers: vi.fn(),
+    getMcpInstructions: vi.fn().mockReturnValue('MCP Instructions'),
+  })),
+}));
 
 vi.mock('../utils/memoryDiscovery.js', () => ({
   loadServerHierarchicalMemory: vi.fn(),
@@ -167,12 +175,15 @@ vi.mock('../utils/fetch.js', () => ({
   setGlobalProxy: mockSetGlobalProxy,
 }));
 
+vi.mock('../services/contextManager.js');
+
 import { BaseLlmClient } from '../core/baseLlmClient.js';
 import { tokenLimit } from '../core/tokenLimits.js';
 import { uiTelemetryService } from '../telemetry/index.js';
 import { getCodeAssistServer } from '../code_assist/codeAssist.js';
 import { getExperiments } from '../code_assist/experiments/experiments.js';
 import type { CodeAssistServer } from '../code_assist/server.js';
+import { ContextManager } from '../services/contextManager.js';
 
 vi.mock('../core/baseLlmClient.js');
 vi.mock('../core/tokenLimits.js', () => ({
@@ -343,10 +354,6 @@ describe('Server Config (config.ts)', () => {
         mockContentConfig,
       );
 
-      // Set fallback mode to true to ensure it gets reset
-      config.setFallbackMode(true);
-      expect(config.isInFallbackMode()).toBe(true);
-
       await config.refreshAuth(authType);
 
       expect(createContentGeneratorConfig).toHaveBeenCalledWith(
@@ -356,8 +363,6 @@ describe('Server Config (config.ts)', () => {
       // Verify that contentGeneratorConfig is updated
       expect(config.getContentGeneratorConfig()).toEqual(mockContentConfig);
       expect(GeminiClient).toHaveBeenCalledWith(config);
-      // Verify that fallback mode is reset
-      expect(config.isInFallbackMode()).toBe(false);
     });
 
     it('should reset model availability status', async () => {
@@ -918,7 +923,7 @@ describe('Server Config (config.ts)', () => {
       expect(DelegateToAgentToolMock).toHaveBeenCalledWith(
         expect.anything(), // AgentRegistry
         config,
-        undefined,
+        expect.anything(), // MessageBus
       );
 
       const calls = registerToolMock.mock.calls;
@@ -1568,40 +1573,32 @@ describe('Config getHooks', () => {
   });
 
   describe('setModel', () => {
-    it('should allow setting a pro (any) model and disable fallback mode', () => {
+    it('should allow setting a pro (any) model and reset availability', () => {
       const config = new Config(baseParams);
       const service = config.getModelAvailabilityService();
       const spy = vi.spyOn(service, 'reset');
-
-      config.setFallbackMode(true);
-      expect(config.isInFallbackMode()).toBe(true);
 
       const proModel = 'gemini-2.5-pro';
       config.setModel(proModel);
 
       expect(config.getModel()).toBe(proModel);
-      expect(config.isInFallbackMode()).toBe(false);
       expect(mockCoreEvents.emitModelChanged).toHaveBeenCalledWith(proModel);
       expect(spy).toHaveBeenCalled();
     });
 
-    it('should allow setting auto model from non-auto model and disable fallback mode', () => {
+    it('should allow setting auto model from non-auto model and reset availability', () => {
       const config = new Config(baseParams);
       const service = config.getModelAvailabilityService();
       const spy = vi.spyOn(service, 'reset');
 
-      config.setFallbackMode(true);
-      expect(config.isInFallbackMode()).toBe(true);
-
       config.setModel('auto');
 
       expect(config.getModel()).toBe('auto');
-      expect(config.isInFallbackMode()).toBe(false);
       expect(mockCoreEvents.emitModelChanged).toHaveBeenCalledWith('auto');
       expect(spy).toHaveBeenCalled();
     });
 
-    it('should allow setting auto model from auto model if it is in the fallback mode', () => {
+    it('should allow setting auto model from auto model and reset availability', () => {
       const config = new Config({
         cwd: '/tmp',
         targetDir: '/path/to/target',
@@ -1613,15 +1610,48 @@ describe('Config getHooks', () => {
       const service = config.getModelAvailabilityService();
       const spy = vi.spyOn(service, 'reset');
 
-      config.setFallbackMode(true);
-      expect(config.isInFallbackMode()).toBe(true);
-
       config.setModel('auto');
 
       expect(config.getModel()).toBe('auto');
-      expect(config.isInFallbackMode()).toBe(false);
-      expect(mockCoreEvents.emitModelChanged).toHaveBeenCalledWith('auto');
       expect(spy).toHaveBeenCalled();
+    });
+
+    it('should reset active model when setModel is called with the current model after a fallback', () => {
+      const config = new Config(baseParams);
+      const originalModel = config.getModel();
+      const fallbackModel = 'fallback-model';
+
+      config.setActiveModel(fallbackModel);
+      expect(config.getActiveModel()).toBe(fallbackModel);
+
+      config.setModel(originalModel);
+
+      expect(config.getModel()).toBe(originalModel);
+      expect(config.getActiveModel()).toBe(originalModel);
+    });
+
+    it('should call onModelChange when a new model is set and should persist', () => {
+      const onModelChange = vi.fn();
+      const config = new Config({
+        ...baseParams,
+        onModelChange,
+      });
+
+      config.setModel(DEFAULT_GEMINI_MODEL, false);
+
+      expect(onModelChange).toHaveBeenCalledWith(DEFAULT_GEMINI_MODEL);
+    });
+
+    it('should NOT call onModelChange when a new model is temporary', () => {
+      const onModelChange = vi.fn();
+      const config = new Config({
+        ...baseParams,
+        onModelChange,
+      });
+
+      config.setModel(DEFAULT_GEMINI_MODEL, true);
+
+      expect(onModelChange).not.toHaveBeenCalled();
     });
   });
 });
@@ -1781,7 +1811,7 @@ describe('Config Quota & Preview Model Access', () => {
     sessionId: 'test-session',
     model: 'gemini-pro',
     usageStatisticsEnabled: false,
-    embeddingModel: 'gemini-embedding', // required in type but not in the original file I copied, adding here
+    embeddingModel: 'gemini-embedding',
     sandbox: {
       command: 'docker',
       image: 'gemini-cli-sandbox',
@@ -1862,6 +1892,15 @@ describe('Config Quota & Preview Model Access', () => {
       expect(config.getModel()).toBe(nonPreviewModel);
     });
 
+    it('should switch to preview auto model if enabling preview features while using default auto model', () => {
+      config.setPreviewFeatures(false);
+      config.setModel(DEFAULT_GEMINI_MODEL_AUTO);
+
+      config.setPreviewFeatures(true);
+
+      expect(config.getModel()).toBe(PREVIEW_GEMINI_MODEL_AUTO);
+    });
+
     it('should NOT reset model if enabling preview features', () => {
       config.setPreviewFeatures(false);
       config.setModel(PREVIEW_GEMINI_MODEL); // Just pretending it was set somehow
@@ -1870,5 +1909,73 @@ describe('Config Quota & Preview Model Access', () => {
 
       expect(config.getModel()).toBe(PREVIEW_GEMINI_MODEL);
     });
+  });
+});
+
+describe('Config JIT Initialization', () => {
+  let config: Config;
+  let mockContextManager: {
+    refresh: Mock;
+    getGlobalMemory: Mock;
+    getEnvironmentMemory: Mock;
+    getLoadedPaths: Mock;
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockContextManager = {
+      refresh: vi.fn(),
+      getGlobalMemory: vi.fn().mockReturnValue('Global Memory'),
+      getEnvironmentMemory: vi
+        .fn()
+        .mockReturnValue('Environment Memory\n\nMCP Instructions'),
+      getLoadedPaths: vi.fn().mockReturnValue(new Set(['/path/to/GEMINI.md'])),
+    };
+    (ContextManager as unknown as Mock).mockImplementation(
+      () => mockContextManager,
+    );
+  });
+
+  it('should initialize ContextManager, load memory, and delegate to it when experimentalJitContext is enabled', async () => {
+    const params: ConfigParameters = {
+      sessionId: 'test-session',
+      targetDir: '/tmp/test',
+      debugMode: false,
+      model: 'test-model',
+      experimentalJitContext: true,
+      userMemory: 'Initial Memory',
+      cwd: '/tmp/test',
+    };
+
+    config = new Config(params);
+    await config.initialize();
+
+    expect(ContextManager).toHaveBeenCalledWith(config);
+    expect(mockContextManager.refresh).toHaveBeenCalled();
+    expect(config.getUserMemory()).toBe(
+      'Global Memory\n\nEnvironment Memory\n\nMCP Instructions',
+    );
+
+    // Verify state update (delegated to ContextManager)
+    expect(config.getGeminiMdFileCount()).toBe(1);
+    expect(config.getGeminiMdFilePaths()).toEqual(['/path/to/GEMINI.md']);
+  });
+
+  it('should NOT initialize ContextManager when experimentalJitContext is disabled', async () => {
+    const params: ConfigParameters = {
+      sessionId: 'test-session',
+      targetDir: '/tmp/test',
+      debugMode: false,
+      model: 'test-model',
+      experimentalJitContext: false,
+      userMemory: 'Initial Memory',
+      cwd: '/tmp/test',
+    };
+
+    config = new Config(params);
+    await config.initialize();
+
+    expect(ContextManager).not.toHaveBeenCalled();
+    expect(config.getUserMemory()).toBe('Initial Memory');
   });
 });
